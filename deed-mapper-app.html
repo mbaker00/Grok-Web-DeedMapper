@@ -10,7 +10,8 @@
     <style>
         body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
         #container { display: flex; height: 100vh; }
-        #map { flex: 3; background: #f8f8f8; }
+        #mapWrap { flex: 3; background: #f8f8f8; min-width: 0; }
+        #map { width: 100%; height: 100%; background: #f8f8f8; }
         #sidebar { flex: 1; padding: 10px; overflow-y: auto; background: white; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
         table { width: 100%; border-collapse: collapse; font-size: 0.9em; margin-top: 10px; }
         th, td { border: 1px solid #ddd; padding: 6px; text-align: left; cursor: pointer; }
@@ -139,18 +140,58 @@
         #cornerIdConsole .ok { color: #8fdc8f; }
         #cornerIdConsole .warn { color: #ffcc66; }
         #cornerIdConsole .muted { color: #999; }
+        #mapWrap { position: relative; flex: 3; min-width: 0; }
+        #mapWrap #map { width: 100%; height: 100%; }
+        #mapToolbar {
+            position: absolute; top: 10px; left: 50px; z-index: 1000;
+            display: flex; flex-direction: column; gap: 4px;
+            background: rgba(255,255,255,0.95); border: 1px solid #888;
+            border-radius: 6px; padding: 6px; box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+            min-width: 160px; font-size: 12px;
+        }
+        #mapToolbar .tb-row { display: flex; gap: 4px; flex-wrap: wrap; }
+        #mapToolbar button {
+            margin: 0; padding: 4px 8px; font-size: 12px; cursor: pointer;
+            border: 1px solid #999; border-radius: 4px; background: #f3f3f3;
+        }
+        #mapToolbar button.active {
+            background: #2c5f8a; color: #fff; border-color: #1f4564;
+        }
+        #mapToolbar button:disabled { opacity: 0.45; cursor: not-allowed; }
+        #mapToolbar #tbStatus {
+            margin: 2px 0 0 0; color: #333; min-height: 2.6em; line-height: 1.3;
+        }
+        #mapToolbar #tbDirty { color: #b35a00; font-weight: bold; display: none; }
+        #mapToolbar #tbDirty.on { display: inline; }
     </style>
 </head>
 <body>
     <div id="container">
-        <div id="map"></div>
+        <div id="mapWrap">
+            <div id="map"></div>
+            <div id="mapToolbar">
+                <div class="tb-row">
+                    <button type="button" id="tbNavigate" class="active" title="Pan, zoom, select parcels">Select</button>
+                    <button type="button" id="tbLink" title="Click two corners on different tracts to assign a shared c-id">Link</button>
+                    <button type="button" id="tbUnlink" title="Click a corner to remove its c-id comment">Unlink</button>
+                </div>
+                <div class="tb-row">
+                    <button type="button" id="tbSaveMbl" title="Write .mbk backup of the previous version, then overwrite the opened .mbl">Save .mbl</button>
+                    <span id="tbDirty">Unsaved</span>
+                </div>
+                <div id="tbStatus">Load an .mbl file, then use Link to pair corners.</div>
+            </div>
+        </div>
         <div id="sidebar">
             <div style="display:flex; gap:8px; align-items:flex-start; margin-bottom:4px;">
                 <div style="flex:0 0 auto; display:flex; flex-direction:column; gap:3px;">
-                    <label style="cursor:pointer;">
-                        <span style="display:inline-block; padding:3px 8px; background:#e0e0e0; border:1px solid #aaa; border-radius:3px; font-size:13px;">Choose .mbl File</span>
-                        <input type="file" id="fileInput" accept=".mbl" style="display:none;">
-                    </label>
+                    <div style="display:flex; gap:4px; flex-wrap:wrap; align-items:center;">
+                        <button type="button" id="openMblBtn" title="Open .mbl with permission to save over the same file" style="margin:0; padding:3px 8px; background:#e0e0e0; border:1px solid #aaa; border-radius:3px; font-size:13px; cursor:pointer;">Open .mbl…</button>
+                        <label style="cursor:pointer; margin:0;" title="Fallback open without overwrite permission">
+                            <span style="display:inline-block; padding:3px 8px; background:#f5f5f5; border:1px solid #ccc; border-radius:3px; font-size:12px; color:#555;">Browse only</span>
+                            <input type="file" id="fileInput" accept=".mbl" style="display:none;">
+                        </label>
+                    </div>
                     <div id="grantFileRow" style="margin: 0; font-size: 12px; color: #666;">
                         <label style="display:inline; cursor:pointer;" title="Load a land grants JSON data file to enable clickable grant links in the ID column">
                             <span id="grantFileLabel">Land Grants JSON (optional):</span>
@@ -314,7 +355,13 @@
         let mainLayerGroup = null;
         let rubberBandLayer = null;
         let showCornerBands = true;
-        // TODO(later): click-to-assign matching corners and write ! c-id-#### comments back into the .mbl file.
+        let mblText = '';
+        let mblTextLastSaved = ''; // last version written to disk / loaded from disk (for .mbk backup)
+        let mblFileNameFull = '';
+        let mblFileHandle = null; // File System Access handle for in-place save
+        let mblDirty = false;
+        let cornerToolMode = 'navigate'; // navigate | link | unlink
+        let linkFirstCorner = null; // { deed, deedIndex, pointIndex, pt }
         let basemapLayer = null;
         let grantData = null;  // NC Land Grants JSON data (loaded alongside MBL file)
 
@@ -801,7 +848,9 @@
                     // Corner ID after Pt, e.g. "! c-id-0001" — attach to the most recent point
                     const cornerMatch = line.match(/\bc-id-\d+\b/i);
                     if (cornerMatch && current.points.length > 0) {
-                        current.points[current.points.length - 1].cornerId = cornerMatch[0].toLowerCase();
+                        const pt = current.points[current.points.length - 1];
+                        pt.cornerId = cornerMatch[0].toLowerCase();
+                        pt.cornerCommentLine = lineNum;
                     }
                     return;
                 }
@@ -829,7 +878,13 @@
                         current.offset.x = parseFloat(parts[1]) || 0;
                         current.offset.y = parseFloat(parts[2]) || 0;
                     } else if (cmd === 'PT') {
-                        current.points.push({coord: {...curPt}, desc: parts.slice(1).join(' ') || 'Corner'});
+                        current.points.push({
+                            coord: {...curPt},
+                            desc: parts.slice(1).join(' ') || 'Corner',
+                            sourceLine: lineNum,
+                            cornerCommentLine: null,
+                            cornerId: null
+                        });
                     } else if (['LN','LM','LC'].includes(cmd)) {
                         let rest = parts.slice(1).join(' ').replace(/\s*;\s*/g, ';'); // Normalize spaces around semicolons
                         let bearing = '';
@@ -1104,6 +1159,310 @@
         }
 
 
+        function setTbStatus(msg) {
+            const el = document.getElementById('tbStatus');
+            if (el) el.textContent = msg;
+        }
+
+        function setMblDirty(dirty) {
+            mblDirty = !!dirty;
+            const el = document.getElementById('tbDirty');
+            if (el) el.classList.toggle('on', mblDirty);
+        }
+
+        function setCornerToolMode(mode) {
+            cornerToolMode = mode;
+            linkFirstCorner = null;
+            document.getElementById('tbNavigate').classList.toggle('active', mode === 'navigate');
+            document.getElementById('tbLink').classList.toggle('active', mode === 'link');
+            document.getElementById('tbUnlink').classList.toggle('active', mode === 'unlink');
+            if (mode === 'navigate') setTbStatus('Select mode: pan, zoom, and click parcels.');
+            else if (mode === 'link') setTbStatus('Link mode: click the first corner, then its match on another tract. Esc cancels.');
+            else if (mode === 'unlink') setTbStatus('Unlink mode: click a corner to remove its c-id comment.');
+            if (deedsData.length > 0) drawOnMap(getVisibleFilteredDeeds(), mainMap, false, true);
+        }
+
+        function getNextCornerId() {
+            let maxN = 0;
+            const re = /\bc-id-(\d+)\b/gi;
+            // Prefer scanning source text so gaps/unparsed IDs still count
+            const src = mblText || '';
+            let m;
+            while ((m = re.exec(src)) !== null) {
+                maxN = Math.max(maxN, parseInt(m[1], 10) || 0);
+            }
+            deedsData.forEach(d => (d.points || []).forEach(pt => {
+                const mm = String(pt.cornerId || '').match(/^c-id-(\d+)$/i);
+                if (mm) maxN = Math.max(maxN, parseInt(mm[1], 10) || 0);
+            }));
+            return 'c-id-' + String(maxN + 1).padStart(4, '0');
+        }
+
+        function joinMblLines(lines) {
+            const nl = mblText.includes('\r\n') ? '\r\n' : '\n';
+            return lines.join(nl);
+        }
+
+        function reloadFromMblText(preserveView = true) {
+            const hdrBefore = {...(parseMBL.header || {})};
+            deedsData = parseMBL(mblText);
+            // Keep form header fields; only fill blanks from file header
+            const hdr = parseMBL.header || hdrBefore;
+            if (hdr.anchor) document.getElementById('anchorId').value = hdr.anchor;
+            if (hdr.lat) document.getElementById('anchorLat').value = hdr.lat;
+            if (hdr.lon) {
+                let lonVal = hdr.lon;
+                if (!String(lonVal).startsWith('-')) lonVal = '-' + lonVal;
+                document.getElementById('anchorLon').value = lonVal;
+            }
+            if (hdr.decl !== undefined) document.getElementById('parcelDeclination').value = hdr.decl;
+            initPlotVisibility();
+            populateTable();
+            drawOnMap(getVisibleFilteredDeeds(), mainMap, false, preserveView);
+        }
+
+        function insertCornerComment(lines, ptLineIndex, cornerId) {
+            // If next line is already a c-id comment, replace it; else insert after Pt
+            const comment = '! ' + cornerId;
+            const next = lines[ptLineIndex + 1] ?? '';
+            if (/^\s*!\s*c-id-\d+/i.test(next)) {
+                lines[ptLineIndex + 1] = comment;
+                return lines;
+            }
+            lines.splice(ptLineIndex + 1, 0, comment);
+            return lines;
+        }
+
+        function removeCornerComment(lines, pt) {
+            if (pt.cornerCommentLine != null && pt.cornerCommentLine >= 0 && pt.cornerCommentLine < lines.length) {
+                if (/\bc-id-\d+\b/i.test(lines[pt.cornerCommentLine])) {
+                    lines.splice(pt.cornerCommentLine, 1);
+                    return lines;
+                }
+            }
+            // Fallback: remove first c-id comment immediately after Pt
+            if (pt.sourceLine != null && pt.sourceLine + 1 < lines.length && /^\s*!\s*c-id-\d+/i.test(lines[pt.sourceLine + 1])) {
+                lines.splice(pt.sourceLine + 1, 1);
+            }
+            return lines;
+        }
+
+        function downloadMblFallback(filename) {
+            const name = filename.endsWith('.mbl') || filename.endsWith('.mbk') ? filename : (filename + '.mbl');
+            const blob = new Blob([mblText], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = name;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            URL.revokeObjectURL(url);
+            return name;
+        }
+
+        function beginLoadMblText(text, fileName, fileHandle) {
+            selectedIndex = -1;
+            labelZoomCutoff = null;
+            clearParcelInfoPanel();
+            linkFirstCorner = null;
+            mblText = text;
+            mblTextLastSaved = text;
+            mblFileNameFull = fileName || 'deed-map.mbl';
+            loadedFileName = mblFileNameFull.replace(/\.[^/.]+$/, '');
+            mblFileHandle = fileHandle || null;
+            setMblDirty(false);
+            const canOverwrite = !!mblFileHandle;
+            setTbStatus(canOverwrite
+                ? ('Opened ' + mblFileNameFull + ' (Save will overwrite this file after writing a .mbk backup).')
+                : ('Loaded ' + mblFileNameFull + ' without overwrite permission. Use “Open .mbl…” to enable in-place Save.'));
+
+            deedsData = parseMBL(mblText);
+            if (deedsData.length === 0) {
+                alert('No deeds parsed from file. Check file format.');
+            }
+            const hdr = parseMBL.header;
+            if (hdr.anchor) document.getElementById('anchorId').value = hdr.anchor;
+            if (hdr.lat) document.getElementById('anchorLat').value = hdr.lat;
+            if (hdr.lon) {
+                let lonVal = hdr.lon;
+                if (!String(lonVal).startsWith('-')) lonVal = '-' + lonVal;
+                document.getElementById('anchorLon').value = lonVal;
+            }
+            if (hdr.decl !== undefined) document.getElementById('parcelDeclination').value = hdr.decl;
+            plotVisible = {};
+            initPlotVisibility();
+        }
+
+        async function openMblWithHandle() {
+            if (!window.showOpenFilePicker) {
+                document.getElementById('fileInput').click();
+                setTbStatus('This browser cannot overwrite files in place. Use Chrome/Edge for Save-over-original, or Browse only + manual replace.');
+                return;
+            }
+            try {
+                const [handle] = await window.showOpenFilePicker({
+                    multiple: false,
+                    types: [{
+                        description: 'DeedMapper MBL',
+                        accept: { 'text/plain': ['.mbl', '.txt'] }
+                    }]
+                });
+                // Ensure we can write later
+                if (handle.queryPermission) {
+                    let perm = await handle.queryPermission({ mode: 'readwrite' });
+                    if (perm !== 'granted' && handle.requestPermission) {
+                        perm = await handle.requestPermission({ mode: 'readwrite' });
+                    }
+                    if (perm !== 'granted') {
+                        alert('Write permission was not granted. Save cannot overwrite the original file.');
+                    }
+                }
+                const file = await handle.getFile();
+                document.getElementById('loading').style.display = 'block';
+                const textContent = await file.text();
+                beginLoadMblText(textContent, file.name, handle);
+                tryLoadGrantsJson(file.name).then((autoLoaded) => {
+                    if (autoLoaded && grantData) {
+                        const status = document.getElementById('grantFileStatus');
+                        const count = Object.keys(grantData).length;
+                        status.textContent = `${count} grants auto-loaded`;
+                        status.style.color = '#2a7b2a';
+                    }
+                    preloadImageCache(deedsData).then(() => {
+                        populateTable();
+                        drawOnMap(getVisibleFilteredDeeds(), mainMap);
+                        document.getElementById('loading').style.display = 'none';
+                    });
+                });
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                console.error(err);
+                alert('Could not open file: ' + (err.message || err));
+                document.getElementById('loading').style.display = 'none';
+            }
+        }
+
+        async function saveMblFile() {
+            if (!mblText) {
+                alert('Load an .mbl file first.');
+                return;
+            }
+            const mblName = mblFileNameFull || (loadedFileName + '.mbl');
+            const mbkName = mblName.replace(/\.mbl$/i, '.mbk');
+
+            // Prefer in-place overwrite when we have a file handle from Open .mbl…
+            if (mblFileHandle && mblFileHandle.createWritable) {
+                try {
+                    setTbStatus('Choose where to save the .mbk backup (same folder as the .mbl is best)…');
+                    let mbkHandle;
+                    try {
+                        mbkHandle = await window.showSaveFilePicker({
+                            suggestedName: mbkName,
+                            startIn: mblFileHandle,
+                            types: [{
+                                description: 'DeedMapper backup (.mbk)',
+                                accept: { 'text/plain': ['.mbk'] }
+                            }]
+                        });
+                    } catch (err) {
+                        if (err && err.name === 'AbortError') {
+                            setTbStatus('Save cancelled — original .mbl was not changed.');
+                            return;
+                        }
+                        throw err;
+                    }
+                    // Backup = last saved/loaded version (prior to current edits)
+                    const backupBody = mblTextLastSaved != null ? mblTextLastSaved : mblText;
+                    const mbkWritable = await mbkHandle.createWritable();
+                    await mbkWritable.write(backupBody);
+                    await mbkWritable.close();
+
+                    const mblWritable = await mblFileHandle.createWritable();
+                    await mblWritable.write(mblText);
+                    await mblWritable.close();
+
+                    mblTextLastSaved = mblText;
+                    setMblDirty(false);
+                    setTbStatus('Saved ' + mblName + ' (overwrote original). Prior version written to ' + (mbkHandle.name || mbkName) + '.');
+                    return;
+                } catch (err) {
+                    console.error(err);
+                    alert('In-place save failed: ' + (err.message || err) + '\nFalling back to download.');
+                }
+            }
+
+            // Fallback: cannot overwrite original without Open .mbl… handle
+            const dl = downloadMblFallback(mblName);
+            setMblDirty(false);
+            setTbStatus('Downloaded ' + dl + ' (original not overwritten). Use “Open .mbl…” next time so Save can write in place with a .mbk backup.');
+            alert('This session cannot overwrite the original file.\n\nDownloaded: ' + dl + '\n\nTo save like DeedMapper (overwrite + .mbk), use “Open .mbl…” (Chrome/Edge), then Save.');
+        }
+
+        function handleCornerToolClick(deed, deedIndex, pointIndex, pt, marker) {
+            if (cornerToolMode === 'navigate') return false;
+
+            if (cornerToolMode === 'unlink') {
+                if (!pt.cornerId) {
+                    setTbStatus('That corner has no c-id to remove.');
+                    return true;
+                }
+                if (!mblText) {
+                    alert('No .mbl text loaded.');
+                    return true;
+                }
+                const lines = mblText.split(/\r?\n/);
+                removeCornerComment(lines, pt);
+                mblText = joinMblLines(lines);
+                setMblDirty(true);
+                linkFirstCorner = null;
+                const removed = pt.cornerId;
+                reloadFromMblText(true);
+                setTbStatus('Removed ' + removed + '. Click Save .mbl to download.');
+                return true;
+            }
+
+            if (cornerToolMode === 'link') {
+                if (!mblText) {
+                    alert('Load an .mbl file first.');
+                    return true;
+                }
+                if (!linkFirstCorner) {
+                    linkFirstCorner = { deed, deedIndex, pointIndex, pt };
+                    setTbStatus('First corner: ' + (deed.metadata.id || ('#' + deedIndex)) + ' / ' + (pt.desc || 'Corner') + '. Now click its match on another tract.');
+                    if (deedsData.length > 0) drawOnMap(getVisibleFilteredDeeds(), mainMap, false, true);
+                    return true;
+                }
+                const first = linkFirstCorner;
+                if (first.deed === deed) {
+                    setTbStatus('Pick a corner on a different tract (not the same plot).');
+                    return true;
+                }
+                const newId = getNextCornerId();
+                let lines = mblText.split(/\r?\n/);
+                // Edit lower line index first so higher indices stay valid when inserting
+                const edits = [
+                    { pt: first.pt, label: first.deed.metadata.id },
+                    { pt: pt, label: deed.metadata.id }
+                ].sort((a, b) => (b.pt.sourceLine ?? 0) - (a.pt.sourceLine ?? 0));
+                for (const ed of edits) {
+                    if (ed.pt.sourceLine == null) {
+                        alert('Corner is missing source line info; reload the .mbl and try again.');
+                        linkFirstCorner = null;
+                        return true;
+                    }
+                    lines = insertCornerComment(lines, ed.pt.sourceLine, newId);
+                }
+                mblText = joinMblLines(lines);
+                setMblDirty(true);
+                linkFirstCorner = null;
+                reloadFromMblText(true);
+                setTbStatus('Linked as ' + newId + ' (' + (first.deed.metadata.id || '?') + ' ↔ ' + (deed.metadata.id || '?') + '). Click Save .mbl to download.');
+                return true;
+            }
+            return false;
+        }
+
         function clearRubberBands() {
             if (rubberBandLayer) rubberBandLayer.clearLayers();
         }
@@ -1314,12 +1673,19 @@
                 deed.points.forEach((pt, i) => {
                     const ptLatLng = declConvert(pt.coord.x, pt.coord.y);
                     const tip = pt.cornerId ? `${pt.desc || 'Corner'} (${pt.cornerId})` : pt.desc;
+                    const isLinkPick = linkFirstCorner && linkFirstCorner.deed === deed && linkFirstCorner.pointIndex === i;
                     const marker = L.circleMarker(ptLatLng, {
-                        radius: getMarkerRadius(),
-                        color: pt.cornerId ? '#cc00aa' : '#ff6600',
-                        fillColor: pt.cornerId ? '#ee66cc' : '#ff8800',
-                        fillOpacity: 0.6
+                        radius: isLinkPick ? Math.max(getMarkerRadius() + 2, 7) : getMarkerRadius(),
+                        color: isLinkPick ? '#0066ff' : (pt.cornerId ? '#cc00aa' : '#ff6600'),
+                        fillColor: isLinkPick ? '#66aaff' : (pt.cornerId ? '#ee66cc' : '#ff8800'),
+                        fillOpacity: 0.75,
+                        weight: isLinkPick ? 3 : 2
                     }).bindTooltip(tip, {direction: 'top'});
+                    marker.on('click', (e) => {
+                        L.DomEvent.stopPropagation(e);
+                        if (handleCornerToolClick(deed, idx, i, pt, marker)) return;
+                        highlightAndCenter(idx, mapInstance);
+                    });
                     layerGroup.addLayer(marker);
                     bounds.extend(ptLatLng);
                     deed.pointMarkers.push(marker);
@@ -1850,44 +2216,17 @@
         };
 
         // File input with loading/error
+        document.getElementById('openMblBtn').onclick = () => openMblWithHandle();
+
         document.getElementById('fileInput').onchange = e => {
             const file = e.target.files[0];
             if (!file) return;
-            loadedFileName = file.name.replace(/\.[^/.]+$/, '');
             document.getElementById('loading').style.display = 'block';
             const reader = new FileReader();
             reader.onload = ev => {
                 try {
-                    // Reset per-session state before loading new file
-                    selectedIndex = -1;
-                    labelZoomCutoff = null;
-                    clearParcelInfoPanel();
-
-                    deedsData = parseMBL(ev.target.result);
-                    if (deedsData.length === 0) {
-                        alert('No deeds parsed from file. Check file format.');
-                    }
-
-                    // Apply header config from MBL comments if present
-                    const hdr = parseMBL.header;
-                    if (hdr.anchor) {
-                        document.getElementById('anchorId').value = hdr.anchor;
-                    }
-                    if (hdr.lat) {
-                        document.getElementById('anchorLat').value = hdr.lat;
-                    }
-                    if (hdr.lon) {
-                        let lonVal = hdr.lon;
-                        // Assume negative longitude for US if not already negative
-                        if (!lonVal.startsWith('-')) lonVal = '-' + lonVal;
-                        document.getElementById('anchorLon').value = lonVal;
-                    }
-                    if (hdr.decl !== undefined) {
-                        document.getElementById('parcelDeclination').value = hdr.decl;
-                    }
-
-                    plotVisible = {};
-                    initPlotVisibility();
+                    // Browse-only path: no file handle, so Save cannot overwrite in place
+                    beginLoadMblText(ev.target.result, file.name, null);
 
                     // Try to auto-load matching grants JSON, then render
                     tryLoadGrantsJson(file.name).then((autoLoaded) => {
@@ -2081,6 +2420,30 @@
         };
 
         // Geographic mode toggle
+        document.getElementById('tbNavigate').onclick = () => setCornerToolMode('navigate');
+        document.getElementById('tbLink').onclick = () => {
+            if (!mblText) { alert('Load an .mbl file first.'); return; }
+            setCornerToolMode('link');
+        };
+        document.getElementById('tbUnlink').onclick = () => {
+            if (!mblText) { alert('Load an .mbl file first.'); return; }
+            setCornerToolMode('unlink');
+        };
+        document.getElementById('tbSaveMbl').onclick = () => { saveMblFile(); };
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && cornerToolMode !== 'navigate') {
+                if (linkFirstCorner) {
+                    linkFirstCorner = null;
+                    setTbStatus(cornerToolMode === 'link'
+                        ? 'Link cancelled. Click the first corner again.'
+                        : 'Unlink mode.');
+                    if (deedsData.length > 0) drawOnMap(getVisibleFilteredDeeds(), mainMap, false, true);
+                } else {
+                    setCornerToolMode('navigate');
+                }
+            }
+        });
+
         document.getElementById('showCornerBands').onchange = (e) => {
             showCornerBands = e.target.checked;
             if (deedsData.length > 0) drawOnMap(getVisibleFilteredDeeds(), mainMap, false, true);
