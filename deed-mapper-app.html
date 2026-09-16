@@ -130,6 +130,15 @@
         }
         #imageZoomControls button { background: #555; border: none; padding: 4px 12px; font-size: 16px; cursor: pointer; border-radius: 3px; color: #eee; }
         #imageZoomControls button:hover { background: #777; }
+        #cornerIdConsole {
+            margin-top: 6px; max-height: 110px; overflow-y: auto;
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 11px; line-height: 1.35; background: #111; color: #d8d8d8;
+            border: 1px solid #444; border-radius: 4px; padding: 6px 8px; white-space: pre-wrap;
+        }
+        #cornerIdConsole .ok { color: #8fdc8f; }
+        #cornerIdConsole .warn { color: #ffcc66; }
+        #cornerIdConsole .muted { color: #999; }
     </style>
 </head>
 <body>
@@ -230,6 +239,12 @@
                     <span style="color: #666; font-size: 0.85em; margin-left: 6px;">Clockwise per-parcel magnetic north adjustment</span>
                 </div>
             </fieldset>
+            <fieldset style="margin: 10px 0; padding: 8px; border: 1px solid #ccc;">
+                <legend style="font-weight: bold; font-size: 0.9em;">Corner Rubber Bands</legend>
+                <label style="display: inline; margin: 0;"><input type="checkbox" id="showCornerBands" checked style="display: inline; margin: 0 4px 0 0;"> Show rubber-band lines between matching corner IDs</label>
+                <div style="margin-top: 6px; font-size: 0.85em; color: #555;">IDs come from <code>! c-id-0001</code> comments immediately after a <code>Pt</code> line. Unmatched IDs are listed below and are not drawn.</div>
+                <div id="cornerIdConsole" class="muted">Load an .mbl file to scan corner IDs.</div>
+            </fieldset>
             <h3>Deeds Table</h3>
             <input type="text" id="searchInput" placeholder="Search by ID, Date, From, To...">
             <div id="loading">Loading...</div>
@@ -297,6 +312,9 @@
         let modalMap = null;
         let deedsData = [];
         let mainLayerGroup = null;
+        let rubberBandLayer = null;
+        let showCornerBands = true;
+        // TODO(later): click-to-assign matching corners and write ! c-id-#### comments back into the .mbl file.
         let basemapLayer = null;
         let grantData = null;  // NC Land Grants JSON data (loaded alongside MBL file)
 
@@ -592,6 +610,8 @@
             mainMap = L.map('map', { crs: L.CRS.Simple, minZoom: -10, maxZoom: 18, zoomSnap: 0, zoomDelta: 1.0, wheelDebounceTime: 80, zoomControl: false, preferCanvas: true }).setView([0, 0], -2);
             addCustomZoomControl(mainMap, 0.5);
             mainLayerGroup = L.featureGroup().addTo(mainMap);
+            if (rubberBandLayer && mainMap.hasLayer(rubberBandLayer)) mainMap.removeLayer(rubberBandLayer);
+            rubberBandLayer = L.layerGroup().addTo(mainMap);
             mainMap.on('zoomend', updateTractLabelVisibility);
             mainMap.on('zoomend', updateCornerDotSizes);
         }
@@ -605,6 +625,8 @@
             mainMap = L.map('map', { minZoom: 4, maxZoom: 18, zoomSnap: 0, zoomDelta: 1.0, wheelDebounceTime: 80, zoomControl: false, preferCanvas: true }).setView([anchorConfig.lat, anchorConfig.lon], 14);
             addCustomZoomControl(mainMap, 0.5);
             mainLayerGroup = L.featureGroup().addTo(mainMap);
+            if (rubberBandLayer && mainMap.hasLayer(rubberBandLayer)) mainMap.removeLayer(rubberBandLayer);
+            rubberBandLayer = L.layerGroup().addTo(mainMap);
             mainMap.on('zoomend', updateTractLabelVisibility);
             mainMap.on('zoomend', updateCornerDotSizes);
 
@@ -775,6 +797,11 @@
                         for (const m of pairs) {
                             parseMBL.header[m[1].toLowerCase()] = m[2];
                         }
+                    }
+                    // Corner ID after Pt, e.g. "! c-id-0001" — attach to the most recent point
+                    const cornerMatch = line.match(/\bc-id-\d+\b/i);
+                    if (cornerMatch && current.points.length > 0) {
+                        current.points[current.points.length - 1].cornerId = cornerMatch[0].toLowerCase();
                     }
                     return;
                 }
@@ -1076,6 +1103,75 @@
             });
         }
 
+
+        function clearRubberBands() {
+            if (rubberBandLayer) rubberBandLayer.clearLayers();
+        }
+
+        function updateUnmatchedCornerConsole(matchedCount, unmatchedEntries) {
+            const el = document.getElementById('cornerIdConsole');
+            if (!el) return;
+            if (!deedsData.length) {
+                el.className = 'muted';
+                el.textContent = 'Load an .mbl file to scan corner IDs.';
+                return;
+            }
+            const lines = [];
+            lines.push(`Matched corner IDs: ${matchedCount}`);
+            if (unmatchedEntries.length === 0) {
+                lines.push('Unmatched corner IDs: none');
+                el.className = 'ok';
+            } else {
+                lines.push(`Unmatched corner IDs (${unmatchedEntries.length}):`);
+                unmatchedEntries.forEach(u => {
+                    lines.push(`  ${u.id} — ${u.deedId || '(no deed id)'} / ${u.desc || 'Corner'}`);
+                });
+                el.className = 'warn';
+            }
+            el.textContent = lines.join('\n');
+        }
+
+        // Rubber bands connect matching c-id values across currently visible deeds only.
+        function updateCornerRubberBands(deeds, convertPtToLatLng) {
+            clearRubberBands();
+            const byId = new Map();
+            (deeds || []).forEach(deed => {
+                const deedId = deed.metadata?.id || '';
+                (deed.points || []).forEach(pt => {
+                    if (!pt.cornerId) return;
+                    const id = String(pt.cornerId).toLowerCase();
+                    if (!byId.has(id)) byId.set(id, []);
+                    byId.get(id).push({ deed, deedId, pt, latlng: convertPtToLatLng(deed, pt) });
+                });
+            });
+
+            let matchedCount = 0;
+            const unmatched = [];
+            byId.forEach((entries, id) => {
+                const deedKeys = new Set(entries.map(e => e.deed));
+                if (deedKeys.size < 2) {
+                    entries.forEach(e => unmatched.push({ id, deedId: e.deedId, desc: e.pt.desc }));
+                    return;
+                }
+                matchedCount += 1;
+                if (!showCornerBands || !rubberBandLayer) return;
+                for (let i = 0; i < entries.length; i++) {
+                    for (let j = i + 1; j < entries.length; j++) {
+                        if (entries[i].deed === entries[j].deed) continue;
+                        const line = L.polyline([entries[i].latlng, entries[j].latlng], {
+                            color: '#cc00aa',
+                            weight: 2,
+                            dashArray: '8, 6',
+                            opacity: 0.9,
+                            interactive: false
+                        }).bindTooltip(`${id}: ${entries[i].deedId || '?'} ↔ ${entries[j].deedId || '?'}`, { sticky: true });
+                        rubberBandLayer.addLayer(line);
+                    }
+                }
+            });
+            updateUnmatchedCornerConsole(matchedCount, unmatched);
+        }
+
         // Draw function: Individual lines with colors, no single outline
         function drawOnMap(deeds, mapInstance, isModal = false, preserveView = false) {
             const layerGroup = isModal ? L.layerGroup() : mainLayerGroup;
@@ -1217,12 +1313,13 @@
                 // Points
                 deed.points.forEach((pt, i) => {
                     const ptLatLng = declConvert(pt.coord.x, pt.coord.y);
+                    const tip = pt.cornerId ? `${pt.desc || 'Corner'} (${pt.cornerId})` : pt.desc;
                     const marker = L.circleMarker(ptLatLng, {
                         radius: getMarkerRadius(),
-                        color: '#ff6600',
-                        fillColor: '#ff8800',
+                        color: pt.cornerId ? '#cc00aa' : '#ff6600',
+                        fillColor: pt.cornerId ? '#ee66cc' : '#ff8800',
                         fillOpacity: 0.6
-                    }).bindTooltip(pt.desc, {direction: 'top'});
+                    }).bindTooltip(tip, {direction: 'top'});
                     layerGroup.addLayer(marker);
                     bounds.extend(ptLatLng);
                     deed.pointMarkers.push(marker);
@@ -1412,6 +1509,26 @@
                 }
             } else {
                 console.warn('No valid bounds');
+            }
+
+            // After parcels are drawn, overlay matching corner rubber bands (main map only).
+            if (!isModal) {
+                const flipY = -1;
+                const scale = SCALE_FACTOR;
+                const declination = parseFloat(document.getElementById('parcelDeclination').value) || 0;
+                updateCornerRubberBands(deeds, (deed, pt) => {
+                    const ox = deed.offset.x;
+                    const oy = deed.offset.y * flipY;
+                    const pivot = deed.lines.length > 0 ? deed.lines[0].from : {x:0, y:0};
+                    const r = applyDeclination(pt.coord.x, pt.coord.y, pivot.x, pivot.y, declination);
+                    const screenX = ox + r.x * scale;
+                    const screenY = oy + r.y * scale;
+                    if (geoModeEnabled) {
+                        const geo = mblToGeo(screenX, screenY);
+                        return L.latLng(geo.lat, geo.lon);
+                    }
+                    return L.latLng(screenY, screenX);
+                });
             }
         }
 
@@ -1964,6 +2081,11 @@
         };
 
         // Geographic mode toggle
+        document.getElementById('showCornerBands').onchange = (e) => {
+            showCornerBands = e.target.checked;
+            if (deedsData.length > 0) drawOnMap(getVisibleFilteredDeeds(), mainMap, false, true);
+        };
+
         document.getElementById('geoMode').onchange = (e) => {
             geoModeEnabled = e.target.checked;
             document.getElementById('geoSettings').style.display = geoModeEnabled ? 'block' : 'none';
